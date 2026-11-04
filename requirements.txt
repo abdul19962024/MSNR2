@@ -1,0 +1,4 @@
+pandas>=2.2,<3
+aiohttp>=3.9,<4
+telethon>=1.36,<2
+dukascopy-python<5

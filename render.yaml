@@ -1,0 +1,39 @@
+services:
+  - type: web
+    name: snb-gold-live
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python snb_gold_live_telegram.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: TELEGRAM_SESSION_STRING
+        sync: false
+      - key: TELEGRAM_CHANNEL
+        sync: false
+      - key: TELEGRAM_ENABLED
+        value: "true"
+      - key: TIMEZONE
+        value: Asia/Riyadh
+      - key: LOOKBACK_HOURS
+        value: "30"
+      - key: POLL_SECONDS
+        value: "5"
+      - key: LIVE_POLL_SECONDS
+        value: "3"
+      - key: SIGNAL_MAX_AGE_MINUTES
+        value: "2"
+      - key: FIXED_STOP_DOLLARS
+        value: "4.0"
+      - key: EQUAL_TOLERANCE
+        value: "0.10"
+      - key: PENDING_EXPIRY_HOURS
+        value: "2"
+      - key: LEVEL_EXPIRY_HOURS
+        value: "4"
+      - key: SNB_DATA_DIR
+        value: /tmp/snb_gold_data

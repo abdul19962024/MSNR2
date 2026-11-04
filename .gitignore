@@ -1,0 +1,6 @@
+.env
+*.session
+snb_gold_data/
+__pycache__/
+*.pyc
+*.log
