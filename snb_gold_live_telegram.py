@@ -328,33 +328,78 @@ def detect_equal_levels(bid: pd.DataFrame) -> list[dict[str, Any]]:
     return levels
 
 
-def find_m1_equal_entry(level: dict[str, Any], bid: pd.DataFrame, ask: pd.DataFrame) -> Optional[dict[str, Any]]:
+def find_m1_equal_entry(
+    level: dict[str, Any],
+    bid: pd.DataFrame,
+    ask: pd.DataFrame,
+) -> Optional[dict[str, Any]]:
     side = level["side"]
     formed = pd.Timestamp(level["formed"])
     expires = pd.Timestamp(level["expires"])
+    now = pd.Timestamp.now(tz="UTC")
+
+    # سعر اللمس: ASK للشراء وBID للبيع
     trigger = ask if side == "buy" else bid
-    touched = trigger[(trigger.index >= formed) & (trigger.index < expires)]
-    touched = touched[touched.low <= level["level"]] if side == "buy" else touched[touched.high >= level["level"]]
-    if not len(touched):
+    touched = trigger[
+        (trigger.index >= formed) &
+        (trigger.index < expires)
+    ]
+    touched = (
+        touched[touched.low <= level["level"]]
+        if side == "buy"
+        else touched[touched.high >= level["level"]]
+    )
+    if touched.empty:
         return None
+
     touch = touched.index[0]
-    now_min = pd.Timestamp.now(tz="UTC").floor("1min")
-    # شموع M1 المغلقة فقط: الشمعة الجارية قد تتغير لونها قبل إغلاقها
-    m1 = bid[(bid.index >= touch) & (bid.index < expires) & (bid.index + pd.Timedelta(minutes=1) <= now_min)]
-    for j in range(1, len(m1)):
-        a, b = m1.iloc[j - 1], m1.iloc[j]
+    now_min = now.floor("1min")
+
+    # شموع M1 المغلقة فقط؛ لا نستخدم الشمعة الجارية
+    m1 = bid[
+        (bid.index >= touch) &
+        (bid.index < expires) &
+        (bid.index + pd.Timedelta(minutes=1) <= now_min)
+    ]
+
+    # نبحث من الأحدث إلى الأقدم حتى لا يحجب تأكيد قديمٌ إشارةً حديثة
+    for j in range(len(m1) - 1, 0, -1):
+        a = m1.iloc[j - 1]
+        b = m1.iloc[j]
+
         if abs(float(a.close) - float(b.open)) > EQUAL_TOLERANCE:
             continue
-        same_color = (a.close > a.open and b.close > b.open) if side == "buy" else (a.close < a.open and b.close < b.open)
+
+        same_color = (
+            a.close > a.open and b.close > b.open
+            if side == "buy"
+            else a.close < a.open and b.close < b.open
+        )
         if not same_color:
             continue
-        equal_point = round((float(a.close) + float(b.open)) / 2, 3)
+
         confirmed = m1.index[j]
-        # الدخول عند إغلاق الشمعة الثانية (سعر الصفقة الفعلي: ASK للشراء، BID للبيع)
+        if local_day(confirmed) != local_day(now):
+            continue
+
+        entry_time = confirmed + pd.Timedelta(minutes=1)
+        age = now - entry_time
+
+        # بما أن الفحص من الأحدث للأقدم، فكل ما بعده أقدم أيضًا
+        if age > pd.Timedelta(minutes=SIGNAL_MAX_AGE_MINUTES):
+            break
+        if age < pd.Timedelta(0):
+            continue
+
+        equal_point = round(
+            (float(a.close) + float(b.open)) / 2,
+            3,
+        )
+
+        # الدخول عند إغلاق شمعة التأكيد: ASK للشراء وBID للبيع
         entry_src = trigger if confirmed in trigger.index else bid
         entry = round(float(entry_src.loc[confirmed, "close"]), 3)
-        if local_day(confirmed) != local_day(pd.Timestamp.now(tz="UTC")):
-            continue
+
         return {
             "key": level["key"] + "|m1|" + confirmed.isoformat(),
             "side": side,
@@ -364,16 +409,24 @@ def find_m1_equal_entry(level: dict[str, Any], bid: pd.DataFrame, ask: pd.DataFr
             "confirm_time": confirmed.isoformat(),
             "equal_point": equal_point,
             "entry": entry,
-            "stop": round(entry - FIXED_STOP_DOLLARS if side == "buy" else entry + FIXED_STOP_DOLLARS, 3),
-            "expiry": (confirmed + pd.Timedelta(hours=PENDING_EXPIRY_HOURS)).isoformat(),
+            "stop": round(
+                entry - FIXED_STOP_DOLLARS
+                if side == "buy"
+                else entry + FIXED_STOP_DOLLARS,
+                3,
+            ),
+            "expiry": (
+                confirmed + pd.Timedelta(hours=PENDING_EXPIRY_HOURS)
+            ).isoformat(),
             "status": "active",
-            "entry_time": (confirmed + pd.Timedelta(minutes=1)).isoformat(),
+            "entry_time": entry_time.isoformat(),
             "entry_source": "M1_CLOSE",
             "message_id": None,
             "best": entry,
             "last_progress": 0.0,
-            "created_at": pd.Timestamp.now(tz="UTC").isoformat(),
+            "created_at": now.isoformat(),
         }
+
     return None
 
 
