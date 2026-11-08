@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""SNB GOLD LIVE — H1 structure + M2 immediate confirmation.
+"""SNB LIVE — H1 structure + M2 immediate confirmation.
 
-Gold-only Telegram signal bot. H1 structure + M2 immediate entries.
+XAUUSD + NAS100 (كل رمز مستقل تماماً عن الآخر).
 This bot sends alerts only; it never places broker orders.
 """
 from __future__ import annotations
@@ -21,7 +21,6 @@ from aiohttp import web
 
 # ---------------- Configuration ----------------
 TZ = os.getenv("TIMEZONE", "Asia/Riyadh")
-INSTRUMENT_NAME = "INSTRUMENT_FX_METALS_XAU_USD"
 TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 TELEGRAM_SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING", "")
@@ -31,23 +30,52 @@ TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "true").lower() == "true"
 DATA_DIR = Path(os.getenv("SNB_DATA_DIR", str(Path.home() / "snb_gold_data")))
 STATE_FILE = DATA_DIR / "snb_gold_state.json"
 LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "30"))
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "5"))                  # فحص الإشارات الجديدة
-LIVE_POLL_SECONDS = int(os.getenv("LIVE_POLL_SECONDS", "3"))        # متابعة السعر اللحظي
-LIVE_WINDOW_MINUTES = int(os.getenv("LIVE_WINDOW_MINUTES", "15"))   # نافذة الجلب الخفيف
-FULL_REFRESH_SECONDS = int(os.getenv("FULL_REFRESH_SECONDS", "60")) # جلب كامل لتصحيح الكاش
-SIGNAL_MAX_AGE_MINUTES = int(os.getenv("SIGNAL_MAX_AGE_MINUTES", "2"))  # تجاهل الإشارات الأقدم (بعد إعادة التشغيل)
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "5"))
+LIVE_POLL_SECONDS = int(os.getenv("LIVE_POLL_SECONDS", "3"))
+LIVE_WINDOW_MINUTES = int(os.getenv("LIVE_WINDOW_MINUTES", "15"))
+FULL_REFRESH_SECONDS = int(os.getenv("FULL_REFRESH_SECONDS", "60"))
+SIGNAL_MAX_AGE_MINUTES = int(os.getenv("SIGNAL_MAX_AGE_MINUTES", "2"))
 SIGNAL_DIAGNOSTICS_SECONDS = int(os.getenv("SIGNAL_DIAGNOSTICS_SECONDS", "300"))
 PENDING_EXPIRY_HOURS = int(os.getenv("PENDING_EXPIRY_HOURS", "2"))
 LEVEL_EXPIRY_HOURS = int(os.getenv("LEVEL_EXPIRY_HOURS", "4"))
-EQUAL_TOLERANCE = float(os.getenv("EQUAL_TOLERANCE", "0.10"))
-FIXED_STOP_DOLLARS = float(os.getenv("FIXED_STOP_DOLLARS", "4.0"))
-PROGRESS_START_DOLLARS = float(os.getenv("PROGRESS_START_DOLLARS", "3.0"))
-PROGRESS_STEP_DOLLARS = float(os.getenv("PROGRESS_STEP_DOLLARS", "2.0"))
 NO_NEW_FIRST_HOUR = os.getenv("NO_NEW_FIRST_HOUR", "true").lower() == "true"
 NO_NEW_LAST_HOUR = os.getenv("NO_NEW_LAST_HOUR", "true").lower() == "true"
 
+# الرموز المفعّلة (Render: SNB_SYMBOLS=XAUUSD,NAS100)
+ENABLED_SYMBOLS = [s.strip().upper() for s in os.getenv("SNB_SYMBOLS", "XAUUSD,NAS100").split(",") if s.strip()]
+
+# ---------- إعدادات كل رمز ----------
+# pt   : مضاعف تحويل حركة السعر إلى نقاط (الذهب 0.1$ = نقطة | الناسداك 1.0 = نقطة)
+# stop : وقف ثابت من الدخول (الناسداك 30.0 => بيع 27100 وقفه 27130)
+CONFIGS: dict[str, dict[str, Any]] = {
+    "XAUUSD": {
+        "instrument_attr": "INSTRUMENT_FX_METALS_XAU_USD",
+        "label": "🥇 XAUUSD",
+        "unit": "$",
+        "pt": 10,
+        "tol": float(os.getenv("EQUAL_TOLERANCE", "0.10")),
+        "stop": float(os.getenv("FIXED_STOP_DOLLARS", "4.0")),
+        "progress_start": float(os.getenv("PROGRESS_START_DOLLARS", "3.0")),
+        "progress_step": float(os.getenv("PROGRESS_STEP_DOLLARS", "2.0")),
+        "nearby": 4.0,
+        "retry_block": 3.0,
+    },
+    "NAS100": {
+        "instrument_attr": "INSTRUMENT_IDX_AMERICA_E_NQ_100",   # E_NQ-100
+        "label": "📊 NASDAQ",
+        "unit": "",
+        "pt": 1,
+        "tol": 1.0,
+        "stop": 30.0,
+        "progress_start": 30.0,
+        "progress_step": 20.0,
+        "nearby": 40.0,
+        "retry_block": 30.0,
+    },
+}
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("snb-gold-h1-m2")
+log = logging.getLogger("snb-h1-m2")
 STOP_REQUESTED = False
 
 
@@ -63,7 +91,7 @@ signal.signal(signal.SIGTERM, stop_handler)
 
 # ---------------- Render health server ----------------
 async def health(request):
-    return web.json_response({"status": "ok", "service": "snb-gold"})
+    return web.json_response({"status": "ok", "service": "snb", "symbols": ENABLED_SYMBOLS})
 
 
 async def start_web_server():
@@ -98,14 +126,30 @@ def save_state(state: dict[str, Any]) -> None:
     tmp.replace(STATE_FILE)
 
 
+def sym_of(tr: dict[str, Any]) -> str:
+    return tr.get("sym", "XAUUSD")   # الصفقات القديمة بدون sym = ذهب
+
+
+def cfg_of(tr: dict[str, Any]) -> dict[str, Any]:
+    return CONFIGS[sym_of(tr)]
+
+
 # ---------------- Dukascopy data ----------------
 def get_duka():
     try:
         import dukascopy_python as duka
-        from dukascopy_python.instruments import INSTRUMENT_FX_METALS_XAU_USD
-        return duka, INSTRUMENT_FX_METALS_XAU_USD
+        import dukascopy_python.instruments as ins
     except Exception as exc:
         raise RuntimeError(f"Dukascopy import failed: {exc!r}") from exc
+    instruments = {}
+    for sym in ENABLED_SYMBOLS:
+        if sym not in CONFIGS:
+            raise RuntimeError(f"Unknown symbol: {sym}")
+        attr = CONFIGS[sym]["instrument_attr"]
+        if not hasattr(ins, attr):
+            raise RuntimeError(f"{sym}: constant {attr} not found in installed dukascopy-python (use 4.0.1)")
+        instruments[sym] = getattr(ins, attr)
+    return duka, instruments
 
 
 def fetch_1m(duka, instrument, side: str, hours: float = LOOKBACK_HOURS, min_rows: int = 30) -> pd.DataFrame:
@@ -228,10 +272,11 @@ def side_word(side: str) -> str:
 
 
 def pending_text(tr: dict[str, Any]) -> str:
+    c = cfg_of(tr)
     arrow = "📈 BUY LIMIT" if tr["side"] == "buy" else "📉 SELL LIMIT"
     return (
         "🔔 **توصية جديدة | صفقة معلقة** 🔔\n\n"
-        "🥇 **XAUUSD**\n"
+        f"**{c['label']}**\n"
         f"{arrow} ➜ **{price(tr['entry'])}**\n\n"
         f"🛑 وقف الخسارة: **{price(tr['stop'])}**\n\n"
         "🎯 الهدف: **مفتوح**\n\n"
@@ -241,6 +286,7 @@ def pending_text(tr: dict[str, Any]) -> str:
 
 
 def entry_text(tr: dict[str, Any]) -> str:
+    c = cfg_of(tr)
     arrow = "📈 BUY" if tr["side"] == "buy" else "📉 SELL"
     title = (
         "🔁 **إعادة دخول بعد وقف الخسارة** 🔁"
@@ -249,7 +295,7 @@ def entry_text(tr: dict[str, Any]) -> str:
     )
     return (
         f"{title}\n\n"
-        "🥇 **XAUUSD**\n"
+        f"**{c['label']}**\n"
         f"{arrow} ➜ **{price(tr['entry'])}**\n\n"
         f"🛑 وقف الخسارة: **{price(tr['stop'])}**\n\n"
         "🎯 الهدف: **مفتوح**\n\n"
@@ -259,9 +305,10 @@ def entry_text(tr: dict[str, Any]) -> str:
 
 
 def cancelled_text(tr: dict[str, Any], reason: str) -> str:
+    c = cfg_of(tr)
     return (
         "❌ **تم إلغاء الأمر المعلق**\n\n"
-        "🥇 **XAUUSD** | " + side_word(tr["side"]) + "\n"
+        f"**{c['label']}** | " + side_word(tr["side"]) + "\n"
         f"📍 المستوى: **{price(tr['entry'])}**\n"
         f"📝 السبب: {reason}\n\n"
         "🗂️ تم الاحتفاظ بسجل الصفقة ولم يُحذف."
@@ -269,43 +316,51 @@ def cancelled_text(tr: dict[str, Any], reason: str) -> str:
 
 
 def activated_text(tr: dict[str, Any]) -> str:
+    c = cfg_of(tr)
     return (
         "✅ **تم تفعيل الصفقة** 🚀\n\n"
-        f"🥇 XAUUSD | **{side_word(tr['side'])}**\n"
+        f"{c['label']} | **{side_word(tr['side'])}**\n"
         f"📍 دخول عند **{price(tr['entry'])}**\n\n"
         "🎯 الهدف مفتوح — نتابع الحركة."
     )
 
 
-def progress_text(tr: dict[str, Any], dollars: float) -> str:
-    return f"🔥 **XAUUSD {side_word(tr['side'])}**\n💰 الحركة لصالح الصفقة: **+{dollars:.2f}$** (+{int(round(dollars * 10))} نقطة)"
+def progress_text(tr: dict[str, Any], move: float) -> str:
+    c = cfg_of(tr)
+    pts = int(round(move * c["pt"]))
+    amount = f"+{move:.2f}{c['unit']}"
+    return f"🔥 **{c['label']} {side_word(tr['side'])}**\n💰 الحركة لصالح الصفقة: **{amount}** (+{pts} نقطة)"
 
 
 def reversed_text(tr: dict[str, Any]) -> str:
+    c = cfg_of(tr)
     return (
         "🔁 **تم إيقاف متابعة الصفقة بسبب إشارة معاكسة**\n\n"
-        f"🥇 XAUUSD | {side_word(tr['side'])}\n"
+        f"{c['label']} | {side_word(tr['side'])}\n"
         f"📍 الدخول: **{price(tr['entry'])}**\n"
         "🗂️ تم الاحتفاظ بسجل الصفقة."
     )
 
 
 def sl_text(tr: dict[str, Any]) -> str:
+    c = cfg_of(tr)
     return (
         "🛑 **انتهت متابعة الصفقة عند وقف الخسارة**\n\n"
-        f"🥇 XAUUSD | {side_word(tr['side'])}\n"
+        f"{c['label']} | {side_word(tr['side'])}\n"
         f"📍 الدخول: **{price(tr['entry'])}**\n"
         "🗂️ تم الاحتفاظ بسجل الصفقة."
     )
 
 
 # ---------------- Strategy ----------------
-def setup_key(ts: pd.Timestamp, side: str) -> str:
-    return f"{ts.isoformat()}|{side}"
+def setup_key(sym: str, ts: pd.Timestamp, side: str) -> str:
+    base = f"{ts.isoformat()}|{side}"
+    return base if sym == "XAUUSD" else f"{sym}|{base}"   # مفاتيح الذهب القديمة تبقى كما هي
 
 
-def detect_equal_levels(bid: pd.DataFrame) -> list[dict[str, Any]]:
+def detect_equal_levels(sym: str, bid: pd.DataFrame) -> list[dict[str, Any]]:
     """Build today's H1 structural levels from adjacent same-color equal-point candles."""
+    c = CONFIGS[sym]
     h1 = closed_resample(bid, 60)
     levels: list[dict[str, Any]] = []
     if len(h1) < 2:
@@ -320,7 +375,7 @@ def detect_equal_levels(bid: pd.DataFrame) -> list[dict[str, Any]]:
         if local_day(formed) != local_day(now):
             continue
         gap = abs(float(first.close) - float(second.open))
-        if gap > EQUAL_TOLERANCE:
+        if gap > c["tol"]:
             continue
         if first.close > first.open and second.close > second.open:
             side = "buy"
@@ -329,7 +384,8 @@ def detect_equal_levels(bid: pd.DataFrame) -> list[dict[str, Any]]:
         else:
             continue
         levels.append({
-            "key": setup_key(h1.index[i], side),
+            "key": setup_key(sym, h1.index[i], side),
+            "sym": sym,
             "side": side,
             "formed": formed.isoformat(),
             "level": round((float(first.close) + float(second.open)) / 2, 3),
@@ -343,6 +399,9 @@ def find_m2_immediate_entry(
     diagnostics: Optional[dict[str, int]] = None,
 ) -> Optional[dict[str, Any]]:
     """After the H1 level is touched, enter at the M2 confirmation close (no limit order)."""
+    sym = level["sym"]
+    c = CONFIGS[sym]
+
     def mark(name: str) -> None:
         if diagnostics is not None:
             diagnostics[name] = diagnostics.get(name, 0) + 1
@@ -374,14 +433,13 @@ def find_m2_immediate_entry(
         mark("not_enough_closed_m2_bars")
         return None
 
-    # Search newest-to-oldest, but only accept adjacent, uninterrupted M2 candles.
     saw_equal_pair = False
     saw_same_color_pair = False
     for j in range(len(bars) - 1, 0, -1):
         if bars.index[j] - bars.index[j - 1] != pd.Timedelta(minutes=2):
             continue
         first, second = bars.iloc[j - 1], bars.iloc[j]
-        if abs(float(first.close) - float(second.open)) > EQUAL_TOLERANCE:
+        if abs(float(first.close) - float(second.open)) > c["tol"]:
             continue
         saw_equal_pair = True
         mark("m2_equal_point_pairs")
@@ -397,7 +455,6 @@ def find_m2_immediate_entry(
 
         bar_start = bars.index[j]
         entry_time = bar_start + pd.Timedelta(minutes=2)
-        # The second M2 candle is confirmed only at its close.
         confirmed_at = entry_time
         if local_day(confirmed_at) != local_day(now):
             mark("confirmation_wrong_local_day")
@@ -415,6 +472,7 @@ def find_m2_immediate_entry(
         equal_point = round((float(first.close) + float(second.open)) / 2, 3)
         return {
             "key": level["key"] + "|m2|" + bar_start.isoformat(),
+            "sym": sym,
             "side": side,
             "level": level["level"],
             "formed": level["formed"],
@@ -422,10 +480,7 @@ def find_m2_immediate_entry(
             "confirm_time": confirmed_at.isoformat(),
             "equal_point": equal_point,
             "entry": entry,
-            "stop": round(
-                entry - FIXED_STOP_DOLLARS if side == "buy" else entry + FIXED_STOP_DOLLARS,
-                3,
-            ),
+            "stop": round(entry - c["stop"] if side == "buy" else entry + c["stop"], 3),
             "expiry": expires.isoformat(),
             "status": "active",
             "entry_time": entry_time.isoformat(),
@@ -444,13 +499,14 @@ def find_m2_immediate_entry(
 
 
 def detect_signals(
-    bid: pd.DataFrame, ask: pd.DataFrame, state: dict[str, Any],
+    sym: str, bid: pd.DataFrame, ask: pd.DataFrame, state: dict[str, Any],
     diagnostics: Optional[dict[str, int]] = None,
 ) -> list[dict[str, Any]]:
+    c = CONFIGS[sym]
     signals: list[dict[str, Any]] = []
     now = pd.Timestamp.now(tz="UTC")
-    trades = state.get("trades", {})
-    levels = detect_equal_levels(bid)
+    trades = {k: t for k, t in state.get("trades", {}).items() if sym_of(t) == sym}
+    levels = detect_equal_levels(sym, bid)
     if diagnostics is not None:
         diagnostics["h1_levels_today"] = len(levels)
     for level in levels:
@@ -468,7 +524,7 @@ def detect_signals(
             continue
         tr["setup_key"] = level["key"]
 
-        # Preserve the $4 nearby-level suppression used in the H1/M2 weekly test.
+        # منع الإشارة إذا وُجد مستوى قريب بنفس الاتجاه (4$ للذهب / 40 للناسداك)
         blocked = False
         for old in trades.values():
             if old.get("side") != tr["side"] or old.get("setup_key") == tr["setup_key"]:
@@ -476,7 +532,7 @@ def detect_signals(
             old_formed = pd.Timestamp(old.get("formed", now))
             if old_formed + pd.Timedelta(hours=LEVEL_EXPIRY_HOURS) <= now:
                 continue
-            if abs(float(old.get("level", 0.0)) - float(tr["level"])) < 4.0:
+            if abs(float(old.get("level", 0.0)) - float(tr["level"])) < c["nearby"]:
                 blocked = True
                 if diagnostics is not None:
                     diagnostics["blocked_by_nearby_same_side_level"] = diagnostics.get("blocked_by_nearby_same_side_level", 0) + 1
@@ -494,7 +550,10 @@ def opposite(side: str) -> str:
 
 
 async def cancel_opposite_pending(state, new_tr, tg):
+    sym = sym_of(new_tr)
     for tr in state["trades"].values():
+        if sym_of(tr) != sym:
+            continue
         if tr.get("status") == "pending" and tr.get("side") == opposite(new_tr["side"]):
             tr["status"] = "cancelled"
             tr["close_reason"] = "OPPOSITE_PENDING"
@@ -507,35 +566,35 @@ async def cancel_opposite_pending(state, new_tr, tg):
 
 
 async def register_signal(state, tr, tg):
+    sym = sym_of(tr)
     await cancel_opposite_pending(state, tr, tg)
-    # An already active opposite trade is no longer counted/tracked after reversal.
+    # صفقة نشطة معاكسة (نفس الرمز فقط) تتوقف متابعتها بصمت
     for old in state["trades"].values():
-        if old.get("status") == "active" and old.get("side") == opposite(tr["side"]):
+        if sym_of(old) == sym and old.get("status") == "active" and old.get("side") == opposite(tr["side"]):
             old["status"] = "closed_reversed"
             old["close_reason"] = "OPPOSITE_SIGNAL"
             old["closed_at"] = pd.Timestamp.now(tz="UTC").isoformat()
-            # إيقاف صامت: لا رسالة في القناة
     msg = await tg.send(entry_text(tr))
     tr["message_id"] = msg
     state["trades"][tr["key"]] = tr
     save_state(state)
     if msg is None:
-        log.warning("Signal registered in preview mode; Telegram message was not sent: %s %s", tr["side"], tr["entry"])
+        log.warning("[%s] Signal registered in preview mode: %s %s", sym, tr["side"], tr["entry"])
     else:
-        log.info("Telegram signal sent: message_id=%s side=%s entry=%s key=%s", msg, tr["side"], tr["entry"], tr["key"])
+        log.info("[%s] Telegram signal sent: message_id=%s side=%s entry=%s key=%s", sym, msg, tr["side"], tr["entry"], tr["key"])
 
 
-async def manage_trades(state, bid, ask, prices, tg):
+async def manage_trades(sym, state, bid, ask, prices, tg):
+    c = CONFIGS[sym]
     now = pd.Timestamp.now(tz="UTC")
     for tr in list(state["trades"].values()):
-        if tr.get("status") not in ("pending", "active"):
+        if sym_of(tr) != sym or tr.get("status") not in ("pending", "active"):
             continue
         side = tr["side"]
         trigger = ask if side == "buy" else bid
         current = prices["ask"] if side == "buy" else prices["bid"]
         expiry = pd.Timestamp(tr["expiry"])
         if tr["status"] == "pending":
-            # الأمر يبدأ بعد إغلاق شمعة التأكيد (confirm + دقيقة)، وينتهي عند الصلاحية
             active_start = pd.Timestamp(tr["confirm_time"]) + pd.Timedelta(minutes=1)
             hit = False
             window = trigger[(trigger.index >= active_start) & (trigger.index < expiry)]
@@ -576,11 +635,11 @@ async def manage_trades(state, bid, ask, prices, tg):
                 tr["status"] = "closed_sl"
                 tr["close_reason"] = "SL"
                 tr["closed_at"] = now.isoformat()
-                # إغلاق صامت: لا رسالة وقف
                 save_state(state)
                 continue
-            if move >= PROGRESS_START_DOLLARS:
-                milestone = PROGRESS_START_DOLLARS + int((move - PROGRESS_START_DOLLARS) // PROGRESS_STEP_DOLLARS) * PROGRESS_STEP_DOLLARS
+            ps, step = c["progress_start"], c["progress_step"]
+            if move >= ps:
+                milestone = ps + int((move - ps) // step) * step
                 if milestone > float(tr.get("last_progress", 0)):
                     tr["last_progress"] = milestone
                     await tg.send(progress_text(tr, milestone), reply_to=tr.get("message_id"))
@@ -591,6 +650,8 @@ async def manage_trades(state, bid, ask, prices, tg):
 # ---------------- Same-zone re-entry after stop ----------------
 def find_m2_retry_entry(base: dict[str, Any], bid: pd.DataFrame, ask: pd.DataFrame) -> Optional[dict[str, Any]]:
     """Find one immediate M2 re-entry after SL in the original H1 zone."""
+    sym = sym_of(base)
+    c = CONFIGS[sym]
     now = pd.Timestamp.now(tz="UTC")
     side = base["side"]
     stopped_at = pd.Timestamp(base["closed_at"])
@@ -615,7 +676,7 @@ def find_m2_retry_entry(base: dict[str, Any], bid: pd.DataFrame, ask: pd.DataFra
         if bars.index[j] - bars.index[j - 1] != pd.Timedelta(minutes=2):
             continue
         first, second = bars.iloc[j - 1], bars.iloc[j]
-        if abs(float(first.close) - float(second.open)) > EQUAL_TOLERANCE:
+        if abs(float(first.close) - float(second.open)) > c["tol"]:
             continue
         same_color = (
             first.close > first.open and second.close > second.open
@@ -640,6 +701,7 @@ def find_m2_retry_entry(base: dict[str, Any], bid: pd.DataFrame, ask: pd.DataFra
         setup_key_value = base.get("setup_key", base["key"])
         return {
             "key": setup_key_value + "|retry|m2|" + bar_start.isoformat(),
+            "sym": sym,
             "setup_key": setup_key_value,
             "parent_trade_key": base["key"],
             "attempt": 1,
@@ -651,10 +713,7 @@ def find_m2_retry_entry(base: dict[str, Any], bid: pd.DataFrame, ask: pd.DataFra
             "confirm_time": confirmed_at.isoformat(),
             "equal_point": equal_point,
             "entry": entry,
-            "stop": round(
-                entry - FIXED_STOP_DOLLARS if side == "buy" else entry + FIXED_STOP_DOLLARS,
-                3,
-            ),
+            "stop": round(entry - c["stop"] if side == "buy" else entry + c["stop"], 3),
             "expiry": zone_expiry.isoformat(),
             "status": "active",
             "entry_time": entry_time.isoformat(),
@@ -667,12 +726,14 @@ def find_m2_retry_entry(base: dict[str, Any], bid: pd.DataFrame, ask: pd.DataFra
     return None
 
 
-async def manage_reentries(state, bid, ask, tg):
+async def manage_reentries(sym, state, bid, ask, tg):
     """Allow one same-direction retry after SL; block it if the first trade reached +30 points."""
+    c = CONFIGS[sym]
     now = pd.Timestamp.now(tz="UTC")
     bases = [
         tr for tr in list(state.get("trades", {}).values())
-        if tr.get("status") == "closed_sl"
+        if sym_of(tr) == sym
+        and tr.get("status") == "closed_sl"
         and tr.get("attempt", 0) == 0
         and not tr.get("retry_used", False)
         and not tr.get("retry_blocked", False)
@@ -685,7 +746,7 @@ async def manage_reentries(state, bid, ask, tg):
             if base["side"] == "buy"
             else float(base["entry"]) - float(base.get("best", base["entry"]))
         )
-        if mfe >= 3.0:
+        if mfe >= c["retry_block"]:
             base["retry_blocked"] = True
             base["retry_block_reason"] = "BASE_REACHED_30_POINTS"
             save_state(state)
@@ -700,9 +761,8 @@ async def manage_reentries(state, bid, ask, tg):
             save_state(state)
             continue
 
-        # A different H1 level touched after the stop cancels this re-entry opportunity.
         touched_new_level = False
-        for level in detect_equal_levels(bid):
+        for level in detect_equal_levels(sym, bid):
             if level["key"] == base.get("setup_key"):
                 continue
             level_formed = pd.Timestamp(level["formed"])
@@ -745,8 +805,8 @@ async def nap(seconds: float) -> None:
         await asyncio.sleep(min(1.0, max(0.0, end - time.monotonic())))
 
 
-async def wait_for_market(duka, instrument):
-    """ينتظر بيانات سليمة بدل أن ينهار (السوق مغلق أو الشبكة متقطعة) فلا تدخل Render في حلقة إعادة تشغيل."""
+async def wait_for_market(sym, duka, instrument):
+    """ينتظر بيانات سليمة بدل أن ينهار (السوق مغلق أو الشبكة متقطعة)."""
     while not STOP_REQUESTED:
         try:
             bid, ask = await asyncio.gather(
@@ -755,31 +815,20 @@ async def wait_for_market(duka, instrument):
             )
             h1 = closed_resample(bid, 60)
             if len(h1) >= 3:
-                log.info("Health check passed: BID=%s ASK=%s closed_H1=%s last=%s",
-                         len(bid), len(ask), len(h1), fmt_time(bid.index[-1]))
+                log.info("[%s] Health check passed: BID=%s ASK=%s closed_H1=%s last=%s",
+                         sym, len(bid), len(ask), len(h1), fmt_time(bid.index[-1]))
                 return bid, ask
-            log.info("Waiting for market data: only %s closed H1 candles", len(h1))
+            log.info("[%s] Waiting for market data: only %s closed H1 candles", sym, len(h1))
         except Exception as exc:
-            log.info("Waiting for market data (market closed or network issue): %r", exc)
+            log.info("[%s] Waiting for market data (market closed or network issue): %r", sym, exc)
         await nap(30)
     return None, None
 
 
-async def main():
-    await start_web_server()
-    duka, instrument = get_duka()
-    tg = TelegramSender()
-    await tg.start()
-    state = load_state()
-
-    startup_msg_id = await tg.send("اللهم صلِّ وسلِّم وبارك على نبينا محمد وعلى آله وصحبه أجمعين ❤️")
-    if startup_msg_id is None:
-        log.info("Startup announcement previewed; waiting for healthy market data.")
-    else:
-        log.info("Startup announcement sent: message_id=%s; waiting for healthy market data.", startup_msg_id)
-    bid, ask = await wait_for_market(duka, instrument)
+async def run_symbol(sym, duka, instrument, state, tg):
+    """حلقة مستقلة بالكامل لكل رمز: كاش وكشف وإدارة صفقات خاصة به."""
+    bid, ask = await wait_for_market(sym, duka, instrument)
     if bid is None:
-        await tg.close()
         return
 
     cache_bid, cache_ask = bid, ask
@@ -790,14 +839,12 @@ async def main():
         try:
             now = pd.Timestamp.now(tz="UTC")
             if (now - last_full).total_seconds() >= FULL_REFRESH_SECONDS:
-                # جلب كامل (30 ساعة) كل دقيقة لتصحيح الكاش
                 nb, na = await asyncio.gather(
                     asyncio.to_thread(fetch_1m, duka, instrument, "BID"),
                     asyncio.to_thread(fetch_1m, duka, instrument, "ASK"),
                 )
                 last_full = now
             else:
-                # جلب خفيف (آخر 15 دقيقة) كل 3 ثوانٍ للسعر اللحظي
                 nb, na = await asyncio.gather(
                     asyncio.to_thread(fetch_1m, duka, instrument, "BID", LIVE_WINDOW_MINUTES / 60, 1),
                     asyncio.to_thread(fetch_1m, duka, instrument, "ASK", LIVE_WINDOW_MINUTES / 60, 1),
@@ -805,29 +852,47 @@ async def main():
             cache_bid, cache_ask = merge_tail(cache_bid, nb), merge_tail(cache_ask, na)
             prices = {"bid": float(nb.close.iloc[-1]), "ask": float(na.close.iloc[-1])}
             if (now - last_detect).total_seconds() >= POLL_SECONDS:
-                scan = {}
-                signals = detect_signals(cache_bid, cache_ask, state, diagnostics=scan)
+                scan: dict[str, int] = {}
+                signals = detect_signals(sym, cache_bid, cache_ask, state, diagnostics=scan)
                 for tr in signals:
                     await register_signal(state, tr, tg)
                 if signals or (now - last_diagnostics_log).total_seconds() >= SIGNAL_DIAGNOSTICS_SECONDS:
                     log.info(
-                        "Signal scan: H1_today=%s touched=%s M2_equal=%s M2_same_color=%s "
+                        "[%s] Signal scan: H1_today=%s touched=%s M2_equal=%s M2_same_color=%s "
                         "stale=%s nearby_block=%s already_registered=%s ready=%s",
-                        scan.get("h1_levels_today", 0), scan.get("levels_touched", 0),
+                        sym, scan.get("h1_levels_today", 0), scan.get("levels_touched", 0),
                         scan.get("m2_equal_point_pairs", 0), scan.get("m2_same_color_pairs", 0),
                         scan.get("m2_confirmation_too_old", 0),
                         scan.get("blocked_by_nearby_same_side_level", 0),
                         scan.get("setup_already_registered", 0), scan.get("signals_ready_to_send", 0),
                     )
                     if not signals:
-                        log.info("Signal scan detail: %s", scan)
+                        log.info("[%s] Signal scan detail: %s", sym, scan)
                     last_diagnostics_log = now
                 last_detect = now
-            await manage_trades(state, cache_bid, cache_ask, prices, tg)
-            await manage_reentries(state, cache_bid, cache_ask, tg)
+            await manage_trades(sym, state, cache_bid, cache_ask, prices, tg)
+            await manage_reentries(sym, state, cache_bid, cache_ask, tg)
         except Exception:
-            log.exception("Polling cycle failed; retrying")
+            log.exception("[%s] Polling cycle failed; retrying", sym)
         await nap(LIVE_POLL_SECONDS)
+
+
+async def main():
+    await start_web_server()
+    duka, instruments = get_duka()
+    tg = TelegramSender()
+    await tg.start()
+    state = load_state()
+
+    startup_msg_id = await tg.send("اللهم صلِّ وسلِّم وبارك على نبينا محمد وعلى آله وصحبه أجمعين ❤️")
+    if startup_msg_id is None:
+        log.info("Startup announcement previewed.")
+    else:
+        log.info("Startup announcement sent: message_id=%s", startup_msg_id)
+
+    await asyncio.gather(*[
+        run_symbol(sym, duka, instruments[sym], state, tg) for sym in ENABLED_SYMBOLS
+    ])
     save_state(state)
     await tg.close()
 
