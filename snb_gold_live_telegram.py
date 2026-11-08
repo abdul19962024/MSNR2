@@ -772,12 +772,13 @@ async def main():
     await tg.start()
     state = load_state()
 
-    # Startup announcement is intentionally disabled; only trade alerts are posted.
-    log.info("Startup channel message disabled; monitoring for trade signals.")
+    log.info("Telegram connected; waiting for healthy market data before startup announcement.")
     bid, ask = await wait_for_market(duka, instrument)
     if bid is None:
         await tg.close()
         return
+    await tg.send("اللهم صلِّ وسلِّم وبارك على نبينا محمد وعلى آله وصحبه أجمعين ❤️")
+    log.info("Startup announcement sent; monitoring for trade signals.")
 
     cache_bid, cache_ask = bid, ask
     last_detect = pd.Timestamp.min.tz_localize("UTC")
