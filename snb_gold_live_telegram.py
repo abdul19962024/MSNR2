@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""SNB GOLD LIVE — M30 Equal Point + M1 Equal Point.
+"""SNB GOLD LIVE — H1 structure + M2 immediate confirmation.
 
-Gold-only Telegram signal bot for Render.
+Gold-only Telegram signal bot. H1 structure + M2 immediate entries.
 This bot sends alerts only; it never places broker orders.
 """
 from __future__ import annotations
@@ -46,7 +46,7 @@ NO_NEW_FIRST_HOUR = os.getenv("NO_NEW_FIRST_HOUR", "true").lower() == "true"
 NO_NEW_LAST_HOUR = os.getenv("NO_NEW_LAST_HOUR", "true").lower() == "true"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("snb-gold-m30-m1")
+log = logging.getLogger("snb-gold-h1-m2")
 STOP_REQUESTED = False
 
 
@@ -241,8 +241,13 @@ def pending_text(tr: dict[str, Any]) -> str:
 
 def entry_text(tr: dict[str, Any]) -> str:
     arrow = "📈 BUY" if tr["side"] == "buy" else "📉 SELL"
+    title = (
+        "🔁 **إعادة دخول بعد وقف الخسارة** 🔁"
+        if tr.get("attempt", 0) == 1
+        else "🔔 **توصية جديدة | دخول فوري** 🔔"
+    )
     return (
-        "🔔 **توصية جديدة | دخول فوري** 🔔\n\n"
+        f"{title}\n\n"
         "🥇 **XAUUSD**\n"
         f"{arrow} ➜ **{price(tr['entry'])}**\n\n"
         f"🛑 وقف الخسارة: **{price(tr['stop'])}**\n\n"
@@ -299,15 +304,19 @@ def setup_key(ts: pd.Timestamp, side: str) -> str:
 
 
 def detect_equal_levels(bid: pd.DataFrame) -> list[dict[str, Any]]:
-    """Find same-color M30 equal levels formed today only."""
-    m30 = closed_resample(bid, 30)
-    levels = []
-    if len(m30) < 3:
+    """Build today's H1 structural levels from adjacent same-color equal-point candles."""
+    h1 = closed_resample(bid, 60)
+    levels: list[dict[str, Any]] = []
+    if len(h1) < 2:
         return levels
-    for i in range(1, len(m30)):
-        first, second = m30.iloc[i - 1], m30.iloc[i]
-        formed = m30.index[i] + pd.Timedelta(minutes=30)
-        if not allow_new(m30.index[i]) or local_day(formed) != local_day(pd.Timestamp.now(tz="UTC")):
+
+    now = pd.Timestamp.now(tz="UTC")
+    for i in range(1, len(h1)):
+        first, second = h1.iloc[i - 1], h1.iloc[i]
+        formed = h1.index[i] + pd.Timedelta(minutes=60)
+        if formed > now or not allow_new(h1.index[i]):
+            continue
+        if local_day(formed) != local_day(now):
             continue
         gap = abs(float(first.close) - float(second.open))
         if gap > EQUAL_TOLERANCE:
@@ -319,7 +328,7 @@ def detect_equal_levels(bid: pd.DataFrame) -> list[dict[str, Any]]:
         else:
             continue
         levels.append({
-            "key": setup_key(m30.index[i], side),
+            "key": setup_key(h1.index[i], side),
             "side": side,
             "formed": formed.isoformat(),
             "level": round((float(first.close) + float(second.open)) / 2, 3),
@@ -328,119 +337,116 @@ def detect_equal_levels(bid: pd.DataFrame) -> list[dict[str, Any]]:
     return levels
 
 
-def find_m1_equal_entry(
-    level: dict[str, Any],
-    bid: pd.DataFrame,
-    ask: pd.DataFrame,
+def find_m2_immediate_entry(
+    level: dict[str, Any], bid: pd.DataFrame, ask: pd.DataFrame
 ) -> Optional[dict[str, Any]]:
+    """After the H1 level is touched, enter at the M2 confirmation close (no limit order)."""
     side = level["side"]
     formed = pd.Timestamp(level["formed"])
     expires = pd.Timestamp(level["expires"])
     now = pd.Timestamp.now(tz="UTC")
 
-    # سعر اللمس: ASK للشراء وBID للبيع
-    trigger = ask if side == "buy" else bid
-    touched = trigger[
-        (trigger.index >= formed) &
-        (trigger.index < expires)
-    ]
-    touched = (
-        touched[touched.low <= level["level"]]
-        if side == "buy"
-        else touched[touched.high >= level["level"]]
-    )
+    touch_quote = ask if side == "buy" else bid
+    touched = touch_quote[(touch_quote.index >= formed) & (touch_quote.index < expires)]
+    touched = touched[touched.low <= level["level"]] if side == "buy" else touched[touched.high >= level["level"]]
     if touched.empty:
         return None
-
     touch = touched.index[0]
+
+    m2_bid = closed_resample(bid, 2)
+    m2_ask = closed_resample(ask, 2)
+    first_full_bar = touch.ceil("2min")
     now_min = now.floor("1min")
-
-    # شموع M1 المغلقة فقط؛ لا نستخدم الشمعة الجارية
-    m1 = bid[
-        (bid.index >= touch) &
-        (bid.index < expires) &
-        (bid.index + pd.Timedelta(minutes=1) <= now_min)
+    bars = m2_bid[
+        (m2_bid.index >= first_full_bar)
+        & (m2_bid.index < expires)
+        & (m2_bid.index + pd.Timedelta(minutes=2) <= now_min)
     ]
+    if len(bars) < 2:
+        return None
 
-    # نبحث من الأحدث إلى الأقدم حتى لا يحجب تأكيد قديمٌ إشارةً حديثة
-    for j in range(len(m1) - 1, 0, -1):
-        a = m1.iloc[j - 1]
-        b = m1.iloc[j]
-
-        if abs(float(a.close) - float(b.open)) > EQUAL_TOLERANCE:
+    # Search newest-to-oldest, but only accept adjacent, uninterrupted M2 candles.
+    for j in range(len(bars) - 1, 0, -1):
+        if bars.index[j] - bars.index[j - 1] != pd.Timedelta(minutes=2):
             continue
-
+        first, second = bars.iloc[j - 1], bars.iloc[j]
+        if abs(float(first.close) - float(second.open)) > EQUAL_TOLERANCE:
+            continue
         same_color = (
-            a.close > a.open and b.close > b.open
+            first.close > first.open and second.close > second.open
             if side == "buy"
-            else a.close < a.open and b.close < b.open
+            else first.close < first.open and second.close < second.open
         )
         if not same_color:
             continue
 
-        confirmed = m1.index[j]
-        if local_day(confirmed) != local_day(now):
+        bar_start = bars.index[j]
+        confirmed_at = bar_start + pd.Timedelta(minutes=1)
+        entry_time = bar_start + pd.Timedelta(minutes=2)
+        if local_day(confirmed_at) != local_day(now):
             continue
-
-        entry_time = confirmed + pd.Timedelta(minutes=1)
         age = now - entry_time
-
-        # بما أن الفحص من الأحدث للأقدم، فكل ما بعده أقدم أيضًا
         if age > pd.Timedelta(minutes=SIGNAL_MAX_AGE_MINUTES):
             break
         if age < pd.Timedelta(0):
             continue
 
-        equal_point = round(
-            (float(a.close) + float(b.open)) / 2,
-            3,
-        )
-
-        # الدخول عند إغلاق شمعة التأكيد: ASK للشراء وBID للبيع
-        entry_src = trigger if confirmed in trigger.index else bid
-        entry = round(float(entry_src.loc[confirmed, "close"]), 3)
-
+        entry_bars = m2_ask if side == "buy" else m2_bid
+        entry = round(float(entry_bars.at[bar_start, "close"]), 3)
+        equal_point = round((float(first.close) + float(second.open)) / 2, 3)
         return {
-            "key": level["key"] + "|m1|" + confirmed.isoformat(),
+            "key": level["key"] + "|m2|" + bar_start.isoformat(),
             "side": side,
             "level": level["level"],
             "formed": level["formed"],
             "touch_time": touch.isoformat(),
-            "confirm_time": confirmed.isoformat(),
+            "confirm_time": confirmed_at.isoformat(),
             "equal_point": equal_point,
             "entry": entry,
             "stop": round(
-                entry - FIXED_STOP_DOLLARS
-                if side == "buy"
-                else entry + FIXED_STOP_DOLLARS,
+                entry - FIXED_STOP_DOLLARS if side == "buy" else entry + FIXED_STOP_DOLLARS,
                 3,
             ),
-            "expiry": (
-                confirmed + pd.Timedelta(hours=PENDING_EXPIRY_HOURS)
-            ).isoformat(),
+            "expiry": expires.isoformat(),
             "status": "active",
             "entry_time": entry_time.isoformat(),
-            "entry_source": "M1_CLOSE",
+            "entry_source": "M2_CLOSE_IMMEDIATE",
+            "attempt": 0,
             "message_id": None,
             "best": entry,
             "last_progress": 0.0,
             "created_at": now.isoformat(),
         }
-
     return None
 
 
 def detect_signals(bid: pd.DataFrame, ask: pd.DataFrame, state: dict[str, Any]) -> list[dict[str, Any]]:
-    signals = []
+    signals: list[dict[str, Any]] = []
+    now = pd.Timestamp.now(tz="UTC")
+    trades = state.get("trades", {})
     for level in detect_equal_levels(bid):
-        if any(t.get("setup_key") == level["key"] for t in state["trades"].values()):
+        if any(t.get("setup_key") == level["key"] for t in trades.values()):
             continue
-        tr = find_m1_equal_entry(level, bid, ask)
-        if tr:
-            age = pd.Timestamp.now(tz="UTC") - (pd.Timestamp(tr["confirm_time"]) + pd.Timedelta(minutes=1))
-            if age > pd.Timedelta(minutes=SIGNAL_MAX_AGE_MINUTES):
-                continue  # إشارة قديمة (مثلاً بعد إعادة تشغيل ضاعت فيها الحالة): لا تُرسل
-            tr["setup_key"] = level["key"]
+        tr = find_m2_immediate_entry(level, bid, ask)
+        if not tr:
+            continue
+        age = now - pd.Timestamp(tr["entry_time"])
+        if age < pd.Timedelta(0) or age > pd.Timedelta(minutes=SIGNAL_MAX_AGE_MINUTES):
+            continue
+        tr["setup_key"] = level["key"]
+
+        # Preserve the $4 nearby-level suppression used in the H1/M2 weekly test.
+        blocked = False
+        for old in trades.values():
+            if old.get("side") != tr["side"] or old.get("setup_key") == tr["setup_key"]:
+                continue
+            old_formed = pd.Timestamp(old.get("formed", now))
+            if old_formed + pd.Timedelta(hours=LEVEL_EXPIRY_HOURS) <= now:
+                continue
+            if abs(float(old.get("level", 0.0)) - float(tr["level"])) < 4.0:
+                blocked = True
+                break
+        if not blocked:
             signals.append(tr)
     return signals
 
@@ -529,6 +535,7 @@ async def manage_trades(state, bid, ask, prices, tg):
             if stopped:
                 tr["status"] = "closed_sl"
                 tr["close_reason"] = "SL"
+                tr["closed_at"] = now.isoformat()
                 # إغلاق صامت: لا رسالة وقف
                 save_state(state)
                 continue
@@ -539,6 +546,156 @@ async def manage_trades(state, bid, ask, prices, tg):
                     await tg.send(progress_text(tr, milestone), reply_to=tr.get("message_id"))
                     save_state(state)
     save_state(state)
+
+
+# ---------------- Same-zone re-entry after stop ----------------
+def find_m2_retry_entry(base: dict[str, Any], bid: pd.DataFrame, ask: pd.DataFrame) -> Optional[dict[str, Any]]:
+    """Find one immediate M2 re-entry after SL in the original H1 zone."""
+    now = pd.Timestamp.now(tz="UTC")
+    side = base["side"]
+    stopped_at = pd.Timestamp(base["closed_at"])
+    formed = pd.Timestamp(base["formed"])
+    zone_expiry = formed + pd.Timedelta(hours=LEVEL_EXPIRY_HOURS)
+    if now >= zone_expiry:
+        return None
+
+    m2_bid = closed_resample(bid, 2)
+    m2_ask = closed_resample(ask, 2)
+    first_full_bar = stopped_at.ceil("2min")
+    now_min = now.floor("1min")
+    bars = m2_bid[
+        (m2_bid.index >= first_full_bar)
+        & (m2_bid.index < zone_expiry)
+        & (m2_bid.index + pd.Timedelta(minutes=2) <= now_min)
+    ]
+    if len(bars) < 2:
+        return None
+
+    for j in range(1, len(bars)):
+        if bars.index[j] - bars.index[j - 1] != pd.Timedelta(minutes=2):
+            continue
+        first, second = bars.iloc[j - 1], bars.iloc[j]
+        if abs(float(first.close) - float(second.open)) > EQUAL_TOLERANCE:
+            continue
+        same_color = (
+            first.close > first.open and second.close > second.open
+            if side == "buy"
+            else first.close < first.open and second.close < second.open
+        )
+        if not same_color:
+            continue
+
+        bar_start = bars.index[j]
+        confirmed_at = bar_start + pd.Timedelta(minutes=1)
+        entry_time = bar_start + pd.Timedelta(minutes=2)
+        if local_day(confirmed_at) != local_day(now):
+            continue
+        age = now - entry_time
+        if age < pd.Timedelta(0) or age > pd.Timedelta(minutes=SIGNAL_MAX_AGE_MINUTES):
+            continue
+
+        entry_bars = m2_ask if side == "buy" else m2_bid
+        entry = round(float(entry_bars.at[bar_start, "close"]), 3)
+        equal_point = round((float(first.close) + float(second.open)) / 2, 3)
+        setup_key_value = base.get("setup_key", base["key"])
+        return {
+            "key": setup_key_value + "|retry|m2|" + bar_start.isoformat(),
+            "setup_key": setup_key_value,
+            "parent_trade_key": base["key"],
+            "attempt": 1,
+            "retry_used": True,
+            "side": side,
+            "level": base["level"],
+            "formed": base["formed"],
+            "touch_time": base.get("touch_time", stopped_at.isoformat()),
+            "confirm_time": confirmed_at.isoformat(),
+            "equal_point": equal_point,
+            "entry": entry,
+            "stop": round(
+                entry - FIXED_STOP_DOLLARS if side == "buy" else entry + FIXED_STOP_DOLLARS,
+                3,
+            ),
+            "expiry": zone_expiry.isoformat(),
+            "status": "active",
+            "entry_time": entry_time.isoformat(),
+            "entry_source": "M2_RETRY_CLOSE_IMMEDIATE",
+            "message_id": None,
+            "best": entry,
+            "last_progress": 0.0,
+            "created_at": now.isoformat(),
+        }
+    return None
+
+
+async def manage_reentries(state, bid, ask, tg):
+    """Allow one same-direction retry after SL; block it if the first trade reached +30 points."""
+    now = pd.Timestamp.now(tz="UTC")
+    bases = [
+        tr for tr in list(state.get("trades", {}).values())
+        if tr.get("status") == "closed_sl"
+        and tr.get("attempt", 0) == 0
+        and not tr.get("retry_used", False)
+        and not tr.get("retry_blocked", False)
+        and tr.get("closed_at")
+    ]
+
+    for base in bases:
+        mfe = (
+            float(base.get("best", base["entry"])) - float(base["entry"])
+            if base["side"] == "buy"
+            else float(base["entry"]) - float(base.get("best", base["entry"]))
+        )
+        if mfe >= 3.0:
+            base["retry_blocked"] = True
+            base["retry_block_reason"] = "BASE_REACHED_30_POINTS"
+            save_state(state)
+            continue
+
+        stopped_at = pd.Timestamp(base["closed_at"])
+        formed = pd.Timestamp(base["formed"])
+        zone_expiry = formed + pd.Timedelta(hours=LEVEL_EXPIRY_HOURS)
+        if now >= zone_expiry:
+            base["retry_blocked"] = True
+            base["retry_block_reason"] = "ZONE_EXPIRED"
+            save_state(state)
+            continue
+
+        # A different H1 level touched after the stop cancels this re-entry opportunity.
+        touched_new_level = False
+        for level in detect_equal_levels(bid):
+            if level["key"] == base.get("setup_key"):
+                continue
+            level_formed = pd.Timestamp(level["formed"])
+            level_expires = pd.Timestamp(level["expires"])
+            left = max(stopped_at, level_formed)
+            right = min(now, level_expires)
+            if left >= right:
+                continue
+            trigger = ask if level["side"] == "buy" else bid
+            window = trigger[(trigger.index >= left) & (trigger.index < right)]
+            touched = (
+                bool((window.low <= level["level"]).any())
+                if level["side"] == "buy"
+                else bool((window.high >= level["level"]).any())
+            ) if len(window) else False
+            if touched:
+                touched_new_level = True
+                break
+
+        if touched_new_level:
+            base["retry_blocked"] = True
+            base["retry_block_reason"] = "NEW_H1_LEVEL_TOUCHED"
+            base["retry_blocked_at"] = now.isoformat()
+            save_state(state)
+            continue
+
+        retry = find_m2_retry_entry(base, bid, ask)
+        if retry:
+            await register_signal(state, retry, tg)
+            base["retry_used"] = True
+            base["retry_trade_key"] = retry["key"]
+            base["retry_at"] = now.isoformat()
+            save_state(state)
 
 
 # ---------------- Main loops ----------------
@@ -556,12 +713,12 @@ async def wait_for_market(duka, instrument):
                 asyncio.to_thread(fetch_1m, duka, instrument, "BID"),
                 asyncio.to_thread(fetch_1m, duka, instrument, "ASK"),
             )
-            m30 = closed_resample(bid, 30)
-            if len(m30) >= 3:
-                log.info("Health check passed: BID=%s ASK=%s closed_M30=%s last=%s",
-                         len(bid), len(ask), len(m30), fmt_time(bid.index[-1]))
+            h1 = closed_resample(bid, 60)
+            if len(h1) >= 3:
+                log.info("Health check passed: BID=%s ASK=%s closed_H1=%s last=%s",
+                         len(bid), len(ask), len(h1), fmt_time(bid.index[-1]))
                 return bid, ask
-            log.info("Waiting for market data: only %s closed M30 candles", len(m30))
+            log.info("Waiting for market data: only %s closed H1 candles", len(h1))
         except Exception as exc:
             log.info("Waiting for market data (market closed or network issue): %r", exc)
         await nap(30)
@@ -611,6 +768,7 @@ async def main():
                     await register_signal(state, tr, tg)
                 last_detect = now
             await manage_trades(state, cache_bid, cache_ask, prices, tg)
+            await manage_reentries(state, cache_bid, cache_ask, tg)
         except Exception as exc:
             log.warning("Polling cycle failed; retrying: %r", exc)
         await nap(LIVE_POLL_SECONDS)
