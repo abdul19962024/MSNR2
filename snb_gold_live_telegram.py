@@ -36,6 +36,7 @@ LIVE_POLL_SECONDS = int(os.getenv("LIVE_POLL_SECONDS", "3"))        # متابع
 LIVE_WINDOW_MINUTES = int(os.getenv("LIVE_WINDOW_MINUTES", "15"))   # نافذة الجلب الخفيف
 FULL_REFRESH_SECONDS = int(os.getenv("FULL_REFRESH_SECONDS", "60")) # جلب كامل لتصحيح الكاش
 SIGNAL_MAX_AGE_MINUTES = int(os.getenv("SIGNAL_MAX_AGE_MINUTES", "2"))  # تجاهل الإشارات الأقدم (بعد إعادة التشغيل)
+SIGNAL_DIAGNOSTICS_SECONDS = int(os.getenv("SIGNAL_DIAGNOSTICS_SECONDS", "300"))
 PENDING_EXPIRY_HOURS = int(os.getenv("PENDING_EXPIRY_HOURS", "2"))
 LEVEL_EXPIRY_HOURS = int(os.getenv("LEVEL_EXPIRY_HOURS", "4"))
 EQUAL_TOLERANCE = float(os.getenv("EQUAL_TOLERANCE", "0.10"))
@@ -338,9 +339,14 @@ def detect_equal_levels(bid: pd.DataFrame) -> list[dict[str, Any]]:
 
 
 def find_m2_immediate_entry(
-    level: dict[str, Any], bid: pd.DataFrame, ask: pd.DataFrame
+    level: dict[str, Any], bid: pd.DataFrame, ask: pd.DataFrame,
+    diagnostics: Optional[dict[str, int]] = None,
 ) -> Optional[dict[str, Any]]:
     """After the H1 level is touched, enter at the M2 confirmation close (no limit order)."""
+    def mark(name: str) -> None:
+        if diagnostics is not None:
+            diagnostics[name] = diagnostics.get(name, 0) + 1
+
     side = level["side"]
     formed = pd.Timestamp(level["formed"])
     expires = pd.Timestamp(level["expires"])
@@ -350,7 +356,9 @@ def find_m2_immediate_entry(
     touched = touch_quote[(touch_quote.index >= formed) & (touch_quote.index < expires)]
     touched = touched[touched.low <= level["level"]] if side == "buy" else touched[touched.high >= level["level"]]
     if touched.empty:
+        mark("levels_not_touched")
         return None
+    mark("levels_touched")
     touch = touched.index[0]
 
     m2_bid = closed_resample(bid, 2)
@@ -363,15 +371,20 @@ def find_m2_immediate_entry(
         & (m2_bid.index + pd.Timedelta(minutes=2) <= now_min)
     ]
     if len(bars) < 2:
+        mark("not_enough_closed_m2_bars")
         return None
 
     # Search newest-to-oldest, but only accept adjacent, uninterrupted M2 candles.
+    saw_equal_pair = False
+    saw_same_color_pair = False
     for j in range(len(bars) - 1, 0, -1):
         if bars.index[j] - bars.index[j - 1] != pd.Timedelta(minutes=2):
             continue
         first, second = bars.iloc[j - 1], bars.iloc[j]
         if abs(float(first.close) - float(second.open)) > EQUAL_TOLERANCE:
             continue
+        saw_equal_pair = True
+        mark("m2_equal_point_pairs")
         same_color = (
             first.close > first.open and second.close > second.open
             if side == "buy"
@@ -379,16 +392,22 @@ def find_m2_immediate_entry(
         )
         if not same_color:
             continue
+        saw_same_color_pair = True
+        mark("m2_same_color_pairs")
 
         bar_start = bars.index[j]
-        confirmed_at = bar_start + pd.Timedelta(minutes=1)
         entry_time = bar_start + pd.Timedelta(minutes=2)
+        # The second M2 candle is confirmed only at its close.
+        confirmed_at = entry_time
         if local_day(confirmed_at) != local_day(now):
+            mark("confirmation_wrong_local_day")
             continue
         age = now - entry_time
         if age > pd.Timedelta(minutes=SIGNAL_MAX_AGE_MINUTES):
+            mark("m2_confirmation_too_old")
             break
         if age < pd.Timedelta(0):
+            mark("m2_confirmation_in_future")
             continue
 
         entry_bars = m2_ask if side == "buy" else m2_bid
@@ -417,21 +436,35 @@ def find_m2_immediate_entry(
             "last_progress": 0.0,
             "created_at": now.isoformat(),
         }
+    if not saw_equal_pair:
+        mark("no_m2_equal_point_pair")
+    elif not saw_same_color_pair:
+        mark("no_m2_same_color_pair")
     return None
 
 
-def detect_signals(bid: pd.DataFrame, ask: pd.DataFrame, state: dict[str, Any]) -> list[dict[str, Any]]:
+def detect_signals(
+    bid: pd.DataFrame, ask: pd.DataFrame, state: dict[str, Any],
+    diagnostics: Optional[dict[str, int]] = None,
+) -> list[dict[str, Any]]:
     signals: list[dict[str, Any]] = []
     now = pd.Timestamp.now(tz="UTC")
     trades = state.get("trades", {})
-    for level in detect_equal_levels(bid):
+    levels = detect_equal_levels(bid)
+    if diagnostics is not None:
+        diagnostics["h1_levels_today"] = len(levels)
+    for level in levels:
         if any(t.get("setup_key") == level["key"] for t in trades.values()):
+            if diagnostics is not None:
+                diagnostics["setup_already_registered"] = diagnostics.get("setup_already_registered", 0) + 1
             continue
-        tr = find_m2_immediate_entry(level, bid, ask)
+        tr = find_m2_immediate_entry(level, bid, ask, diagnostics)
         if not tr:
             continue
         age = now - pd.Timestamp(tr["entry_time"])
         if age < pd.Timedelta(0) or age > pd.Timedelta(minutes=SIGNAL_MAX_AGE_MINUTES):
+            if diagnostics is not None:
+                diagnostics["signal_too_old_at_registration"] = diagnostics.get("signal_too_old_at_registration", 0) + 1
             continue
         tr["setup_key"] = level["key"]
 
@@ -445,9 +478,13 @@ def detect_signals(bid: pd.DataFrame, ask: pd.DataFrame, state: dict[str, Any]) 
                 continue
             if abs(float(old.get("level", 0.0)) - float(tr["level"])) < 4.0:
                 blocked = True
+                if diagnostics is not None:
+                    diagnostics["blocked_by_nearby_same_side_level"] = diagnostics.get("blocked_by_nearby_same_side_level", 0) + 1
                 break
         if not blocked:
             signals.append(tr)
+    if diagnostics is not None:
+        diagnostics["signals_ready_to_send"] = len(signals)
     return signals
 
 
@@ -482,7 +519,10 @@ async def register_signal(state, tr, tg):
     tr["message_id"] = msg
     state["trades"][tr["key"]] = tr
     save_state(state)
-    log.info("Registered %s %s at %s", tr["side"], tr["entry"], tr["key"])
+    if msg is None:
+        log.warning("Signal registered in preview mode; Telegram message was not sent: %s %s", tr["side"], tr["entry"])
+    else:
+        log.info("Telegram signal sent: message_id=%s side=%s entry=%s key=%s", msg, tr["side"], tr["entry"], tr["key"])
 
 
 async def manage_trades(state, bid, ask, prices, tg):
@@ -732,18 +772,16 @@ async def main():
     await tg.start()
     state = load_state()
 
-    # Critical gate: no startup prayer message until Telegram and market candles are healthy.
+    # Startup announcement is intentionally disabled; only trade alerts are posted.
+    log.info("Startup channel message disabled; monitoring for trade signals.")
     bid, ask = await wait_for_market(duka, instrument)
     if bid is None:
         await tg.close()
         return
-    if not state.get("started_message_sent"):
-        await tg.send("اللهم صلِّ وسلّم وبارك على نبينا محمد وعلى آله وصحبه أجمعين ❤️")
-        state["started_message_sent"] = True
-        save_state(state)
 
     cache_bid, cache_ask = bid, ask
     last_detect = pd.Timestamp.min.tz_localize("UTC")
+    last_diagnostics_log = pd.Timestamp.min.tz_localize("UTC")
     last_full = pd.Timestamp.now(tz="UTC")
     while not STOP_REQUESTED:
         try:
@@ -764,13 +802,28 @@ async def main():
             cache_bid, cache_ask = merge_tail(cache_bid, nb), merge_tail(cache_ask, na)
             prices = {"bid": float(nb.close.iloc[-1]), "ask": float(na.close.iloc[-1])}
             if (now - last_detect).total_seconds() >= POLL_SECONDS:
-                for tr in detect_signals(cache_bid, cache_ask, state):
+                scan = {}
+                signals = detect_signals(cache_bid, cache_ask, state, diagnostics=scan)
+                for tr in signals:
                     await register_signal(state, tr, tg)
+                if signals or (now - last_diagnostics_log).total_seconds() >= SIGNAL_DIAGNOSTICS_SECONDS:
+                    log.info(
+                        "Signal scan: H1_today=%s touched=%s M2_equal=%s M2_same_color=%s "
+                        "stale=%s nearby_block=%s already_registered=%s ready=%s",
+                        scan.get("h1_levels_today", 0), scan.get("levels_touched", 0),
+                        scan.get("m2_equal_point_pairs", 0), scan.get("m2_same_color_pairs", 0),
+                        scan.get("m2_confirmation_too_old", 0),
+                        scan.get("blocked_by_nearby_same_side_level", 0),
+                        scan.get("setup_already_registered", 0), scan.get("signals_ready_to_send", 0),
+                    )
+                    if not signals:
+                        log.info("Signal scan detail: %s", scan)
+                    last_diagnostics_log = now
                 last_detect = now
             await manage_trades(state, cache_bid, cache_ask, prices, tg)
             await manage_reentries(state, cache_bid, cache_ask, tg)
-        except Exception as exc:
-            log.warning("Polling cycle failed; retrying: %r", exc)
+        except Exception:
+            log.exception("Polling cycle failed; retrying")
         await nap(LIVE_POLL_SECONDS)
     save_state(state)
     await tg.close()
