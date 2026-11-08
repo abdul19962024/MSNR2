@@ -772,13 +772,15 @@ async def main():
     await tg.start()
     state = load_state()
 
-    log.info("Telegram connected; waiting for healthy market data before startup announcement.")
+    startup_msg_id = await tg.send("اللهم صلِّ وسلِّم وبارك على نبينا محمد وعلى آله وصحبه أجمعين ❤️")
+    if startup_msg_id is None:
+        log.info("Startup announcement previewed; waiting for healthy market data.")
+    else:
+        log.info("Startup announcement sent: message_id=%s; waiting for healthy market data.", startup_msg_id)
     bid, ask = await wait_for_market(duka, instrument)
     if bid is None:
         await tg.close()
         return
-    await tg.send("اللهم صلِّ وسلِّم وبارك على نبينا محمد وعلى آله وصحبه أجمعين ❤️")
-    log.info("Startup announcement sent; monitoring for trade signals.")
 
     cache_bid, cache_ask = bid, ask
     last_detect = pd.Timestamp.min.tz_localize("UTC")
